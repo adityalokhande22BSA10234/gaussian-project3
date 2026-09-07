@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Generated data & artifacts (reproducible via `python main.py generate`)
+dataset/images/
+dataset/labels.csv
+dataset/preview.png
+checkpoints/*.pt
+
+.DS_Store

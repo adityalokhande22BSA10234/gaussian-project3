@@ -2,10 +2,10 @@
 __pycache__/
 *.pyc
 
-# Generated data & artifacts (reproducible via `python main.py generate`)
-dataset/images/
-dataset/labels.csv
-dataset/preview.png
+# Redundant generator backups (committed once by mistake, kept out of the tree)
+dataset/_synthetic_backup_*/
+
+# Model artifacts
 checkpoints/*.pt
 
 .DS_Store

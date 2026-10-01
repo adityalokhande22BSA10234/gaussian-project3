@@ -1,70 +1,76 @@
-# Real-image preprocessing & inference
+# Preprocessing & inference
 
-`python3 main.py infer --image <path> --model-path checkpoints/<model>_best.pt`
-runs a trained model on a real (or synthetic) beam-camera image.
+```
+python main.py infer --image <path> --model-path checkpoints/<model>_best.pt
+```
+
+runs a trained model on a beam-camera image and returns
+`(x, y, sigma_x, sigma_y)` in original-image pixels.
 
 ## Pipeline (`inference/preprocess.py` + `inference/infer.py`)
 
 1. **Acquisition** -- `load_grayscale(path)` reads any image file
-   (`cv2.imread` with `IMREAD_GRAYSCALE`), converting color images to
-   grayscale automatically.
+   (`cv2.imread` with `IMREAD_GRAYSCALE`), converting colour to grayscale
+   automatically.
 
 2. **Background subtraction** -- `subtract_background(image, background=None)`:
-   - If you pass a real *measured* background/dark frame (captured with
-     the beam blocked), it's subtracted directly via `cv2.subtract`.
-   - If you don't, the function does **not** try to estimate one by
-     blurring the image itself. Early testing showed this fails: this
-     project's beams can have sigma up to 90px, comparable to or larger
-     than a typical blur kernel, so self-blur-subtraction erases most of
-     the beam along with the ambient light it's meant to remove. Instead,
-     a light median filter (kernel size 3) is applied, which still
-     removes isolated hot-pixel noise without touching smooth Gaussian
-     blobs of any size.
+   - Pass a *measured* background frame (captured with the beam blocked) and it
+     is subtracted directly via `cv2.subtract`.
+   - Without one, it applies a light median filter (kernel 3) instead of trying
+     to estimate a background by blurring the image. Self-blur-subtraction is
+     unsafe here: beams reach `sigma` ~120 px, comparable to or larger than a
+     typical blur kernel, so it erases the beam along with the ambient light.
+     A median filter still kills isolated hot pixels and leaves smooth
+     Gaussian blobs of any size untouched.
 
-3. **ROI (region-of-interest) cropping** -- `threshold_roi(image, thresh_ratio=0.15, padding=30)`:
-   - Blurs slightly, thresholds at `thresh_ratio * max_intensity`.
-   - Finds the largest connected bright contour via `cv2.findContours`.
-   - Crops to its bounding box plus 30px padding on each side.
-   - Falls back to the full frame if no contour is found (e.g. an empty
-     frame).
+3. **Full-frame resize** -- `to_model_input(frame, resolution)` resizes the
+   **whole frame** to 128x128 bilinear, scales to `[0, 1]`, shapes
+   `(1, 1, 128, 128)`.
 
-4. **Inference** -- `run_inference(image_path, model_path)`:
-   - Resizes the ROI crop to the model's training resolution (128x128 by
-     default) and runs it through the model.
-   - Rescales the normalized outputs back to real pixel coordinates:
-     - `x`, `y` are fractions of the input frame, so they scale directly
-       by the ROI's actual width/height.
-     - `sigma_x`, `sigma_y` were normalized against a full
-       `IMG_WIDTH`/`IMG_HEIGHT`-sized canvas during training, so they're
-       rescaled by `(roi_width / IMG_WIDTH)` and `(roi_height /
-       IMG_HEIGHT)` respectively to account for the ROI crop being
-       smaller (or larger) than that canvas.
-   - Returns `{has_beam, x, y, sigma_x, sigma_y, roi_bbox}`, all in the
-     original image's pixel coordinates.
+4. **Inference** -- the outputs are denormalized straight back to pixel units:
+   `x = x_norm * IMG_WIDTH`, `y = y_norm * IMG_HEIGHT`,
+   `sigma = sigma_norm * MAX_SIGMA_NORM`. No crop geometry enters the
+   calculation, because no crop happened.
+
+## The ROI crop that used to be here
+
+`preprocess_for_inference` previously cropped to the brightest blob before
+resizing (`threshold_roi`, ROI + 30 px padding) and rescaled the outputs by the
+crop dimensions. That was a **train/inference distribution mismatch**: training
+fed whole frames resized to 128x128 (`data/dataset.py:__getitem__`), while
+inference fed a tightly-cropped beam stretched to fill the same 128x128. The
+beam's apparent size, its position within the canvas, and its surrounding
+context all differed from anything the network had seen, so predictions on real
+frames were not comparable to training or evaluation numbers.
+
+`find_blob_bbox` survives **purely for drawing an overlay** on a result. It
+never feeds the network, and its return value is not an input to the rescaling.
 
 ## Tips for real camera captures
 
-- **Grayscale, 8-bit**: convert color images beforehand if needed; 16-bit
-  raw sensor data should be rescaled to 8-bit first.
-- **Avoid saturation**: use neutral-density (ND) filters -- laser beams
-  are usually far too bright for a bare sensor, and a clipped/blown-out
-  peak breaks the Gaussian assumption.
-- **Fixed exposure/gain**: disable auto-exposure; it distorts the beam's
-  true intensity profile between frames.
-- **Capture a real dark/background frame** if possible (camera output
-  with the beam blocked) and pass it to `subtract_background()` -- this
-  is more reliable than the no-background fallback for cluttered or
-  non-uniformly-lit scenes.
-- Resolution doesn't need to match 640x480 -- the ROI-cropping step
-  handles arbitrary real image sizes and rescales correctly.
+- **Grayscale, 8-bit**: 16-bit raw sensor data must be rescaled to 8-bit first.
+- **Avoid saturation**: use neutral-density filters. A clipped, blown-out peak
+  breaks the Gaussian assumption the moments rely on.
+- **Fixed exposure/gain**: disable auto-exposure; it changes the beam's true
+  intensity profile between frames.
+- **Capture a real dark frame** if possible and pass it to
+  `subtract_background()` -- more reliable than the no-background fallback for
+  cluttered or non-uniformly-lit scenes.
+- **Resolution need not be 640x480.** The full frame is resized to a square
+  128x128, so any input size works. Note the aspect ratio is *not* preserved
+  by the square resize; that is inherent to the training pipeline, not to
+  inference.
+- **Border bars** in real instrument frames can dominate a prediction. Label
+  extraction masks the outer 40x30 px for that reason; inference deliberately
+  does not, because the model is trained on unmasked frames.
 
-## Known limitation
+## Known limitations
 
-A trained model's accuracy is bounded by what it saw in training: the
-synthetic dataset covers sigma in `[15, 90]` px, centered away from the
-frame edges by a margin, on a clean (or moderately noisy) background. A
-real capture far outside that regime (e.g. a beam much larger than 90px,
-or one clipped at the frame edge) is out-of-distribution and will likely
-be poorly estimated. If real captures consistently fall outside the
-synthetic ranges, adjust `config.MIN_SIGMA`/`MAX_SIGMA`/`CENTER_MARGIN`
-and regenerate the dataset before retraining.
+- Accuracy is bounded by the derived labels it was trained on. The test classes
+  are unseen, and aggregate test MAE is dominated by `gs23`, whose own labels
+  are largely outliers -- see [dataset.md](dataset.md#known-limitations).
+- `train_model` does not seed torch, so repeat runs differ slightly and
+  checkpoints are not bit-reproducible. `--seed` on `main.py labels` only
+  controls the train/val carve.
+- The presence output is a constant on this data (every frame has a beam), so
+  it cannot be used to reject beamless input.

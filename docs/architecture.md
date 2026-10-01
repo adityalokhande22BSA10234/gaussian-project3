@@ -2,84 +2,89 @@
 
 ## Pipeline overview
 
-The project implements a 3-stage pipeline for regressing 2D Gaussian laser
-beam parameters -- center `(x, y)` and spread `(sigma_x, sigma_y)` -- from
-camera images, using only synthetic training data:
+The project regresses 2D laser beam parameters -- centre `(x, y)` and spread
+`(sigma_x, sigma_y)` -- from beam-camera frames. It trains on the **real
+captures** in `new_dataset/`, using labels derived from those same frames:
 
-1. **Synthetic dataset generation & annotation** (`synthetic/`) -- render
-   2D Gaussian beam images with diverse sizes, shifted centers,
-   rotation/tilt, noise, and beam-free background frames, each with
-   continuous ground-truth parameters.
-2. **CNN model training** (`models/`, `training/`) -- a convolutional
-   backbone (custom ConvNet or ResNet) feeds a regression head ending in 4
-   sigmoid-bounded outputs, trained with a masked Smooth L1 loss against
-   normalized ground truth.
-3. **Real image preprocessing & inference** (`inference/`) -- background
-   subtraction, ROI cropping, and running the trained model on a real
-   camera capture to recover calibrated beam parameters.
+1. **Label extraction** (`data/real_dataset.py`) -- for each capture, mask the
+   frame border, Otsu-threshold, score the connected blobs on roundness x
+   ellipse fill x brightness, and take intensity-weighted moments of the winner.
+   Writes `new_dataset/labels.csv` plus the train/val/test assignment.
+2. **CNN training** (`models/`, `training/`) -- a convolutional backbone
+   (custom ConvNet or ResNet) with a sigmoid-bounded 4-output regression head,
+   trained with a masked Smooth L1 loss against normalized targets.
+3. **Inference** (`inference/`) -- feed the full frame resized to 128x128 and
+   denormalize the predictions back to pixel units.
 
-`main.py` ties all three stages together behind a single CLI (see the
-[repo-root README](../README.md) for how to run it).
+`main.py` exposes all of it behind one CLI; `app.py` exposes the same operations
+as a Streamlit dashboard.
 
 ## Project structure
 
 ```
 .
-├── main.py                    # CLI entry point (all/generate/validate/preview/train/evaluate/infer)
-├── config.py                  # all tunable constants (paths, sizes, counts, hyperparams)
+├── main.py                    # CLI entry point (all/labels/generate/validate/preview/train/evaluate/infer)
+├── app.py                     # Streamlit dashboard; also launchable as plain `python app.py`
+├── config.py                  # all tunable constants (paths, geometry, extraction, hyperparams)
 ├── requirements.txt
-├── synthetic/
-│   ├── generator.py           # 2D Gaussian rendering + noise/gradient augmentations
-│   └── dataset_builder.py     # writes images/labels.csv to disk
 ├── data/
+│   ├── real_dataset.py        # label extraction from captures + labels.csv builder
 │   ├── dataset.py             # PyTorch Dataset
 │   ├── validate.py            # dataset quality checks (image integrity, label sanity)
 │   └── preview.py             # saves a per-category sample grid image
 ├── models/
 │   └── cnn.py                 # 3 CNN architectures: tiny / medium / resnet18
 ├── training/
-│   ├── train.py                # training loop
-│   └── evaluate.py            # pixel-space MAE + presence accuracy
+│   ├── train.py               # training loop
+│   └── evaluate.py            # pixel-space MAE, aggregate and per gs class
 ├── inference/
-│   ├── preprocess.py          # background subtraction + ROI cropping
-│   └── infer.py                # runs a trained model on a real image
-├── scripts/                   # thin CLI wrappers around each module (main.py covers the same ground)
+│   ├── preprocess.py          # background subtraction + full-frame resize
+│   └── infer.py               # runs a trained model on an image
+├── scripts/                   # thin CLI wrappers around each module
+├── synthetic/                 # legacy generator, used only by `main.py generate`
 ├── docs/                      # this documentation
-├── dataset/                   # generated images + labels.csv (gitignored)
-└── checkpoints/               # trained model weights, <model>_best.pt (gitignored)
+├── new_dataset/               # 630 real captures + derived labels.csv (committed)
+├── dataset/                   # legacy generated synthetic images
+├── checkpoints/               # trained weights, <model>_best.pt (gitignored)
+└── Project_Progress_Report.pdf # step-by-step writeup of the work
 ```
 
 ## Module map
 
 | Module | Responsibility |
 |---|---|
-| `config.py` | Single source of truth for every tunable constant: image size, dataset counts, sigma ranges, training hyperparameters, checkpoint paths. |
-| `synthetic/generator.py` | Renders a single 2D (optionally rotated) Gaussian image plus noise/gradient/hot-pixel augmentations. One function per dataset category. |
-| `synthetic/dataset_builder.py` | Drives `generator.py` to build the full dataset, writes PNGs organized by category subfolder, and `labels.csv` with an 80/10/10 train/val/test split. |
-| `data/dataset.py` | `BeamDataset(torch.utils.data.Dataset)` -- loads an image + normalized target tensor from `labels.csv`. |
-| `data/validate.py` | Checks every image exists, is the right size/mode, has a sane peak brightness for its category, and that labels have no NaNs/out-of-range values. |
-| `data/preview.py` | Saves a matplotlib grid of sample images per category, for a quick visual sanity check. |
+| `config.py` | Single source of truth for paths, image geometry, label-extraction thresholds, and training hyperparameters. `DATASET_DIR` and `SYNTHETIC_DIR` are deliberately distinct so generated images can never mix into the real capture set. |
+| `data/real_dataset.py` | Derives one label per capture (`extract_label`), scores candidate blobs (`_blob_score`), computes moments (`_moments_to_params`), enumerates captures (`iter_capture_images`), and writes `labels.csv` with the split assignment. |
+| `data/dataset.py` | `BeamDataset(torch.utils.data.Dataset)` -- loads an image + normalized target from `labels.csv`, resizing the whole frame to 128x128. |
+| `data/validate.py` | Checks every referenced image exists, is 640x480 grayscale, and that labels have no NaNs or out-of-range values. |
+| `data/preview.py` | Saves a matplotlib grid of sample images per class for a visual check. |
 | `models/cnn.py` | The three interchangeable CNN backbones + regression heads (see [models.md](models.md)). |
-| `training/train.py` | Training loop: masked Smooth L1 + BCE loss, best-checkpoint saving, MPS/CUDA/CPU device auto-detection. |
-| `training/evaluate.py` | Runs a checkpoint over a split and reports pixel-space MAE + beam-presence accuracy. |
-| `inference/preprocess.py` | Background subtraction and ROI (region-of-interest) cropping for a real camera image. |
-| `inference/infer.py` | Loads a checkpoint, preprocesses a real image, and returns calibrated `(x, y, sigma_x, sigma_y)` in real pixel coordinates. |
-| `main.py` | argparse CLI wiring all of the above together, plus the default `all` pipeline (generate-if-missing -> train all models -> summary). |
+| `training/train.py` | Training loop: masked Smooth L1 + BCE, best-checkpoint saving, MPS/CUDA/CPU detection. Does not seed torch. |
+| `training/evaluate.py` | Runs a checkpoint over a split; reports pixel-space MAE and, with `--by-category`, per-gs-class MAE. |
+| `inference/preprocess.py` | Background subtraction and full-frame resize. `find_blob_bbox` is display-only. |
+| `inference/infer.py` | Loads a checkpoint, preprocesses an image, returns `(x, y, sigma_x, sigma_y)` in pixel coordinates. |
+| `main.py` | argparse CLI wiring all of the above, plus the default `all` pipeline (extract labels if missing -> train -> summary). |
+| `app.py` | Streamlit dashboard: Home / Dataset / Training / Evaluation / Inference, with training and evaluation as background jobs. |
 
-## Deliberate deviations from the original spec
+## Key design decisions
 
-The original spec (pasted at the start of this project) gave example
-values, not hard requirements. A few choices in this implementation
-diverge from those examples, each for a specific reason:
+| Decision | Why |
+|---|---|
+| Train on the real captures, not the synthetic set | Synthetic frames are clean Gaussians; the captures are instrument output with edge bars, hot pixels, and variable gain. Training on the deployment distribution mattered far more than having exact ground truth. |
+| Derive labels per frame instead of filtering frames | Real captures have no ground truth, so a target had to be computed somehow. All 630 frames are kept -- dropping the hard ones would hide the very failure mode worth measuring. |
+| Hold `test2` out whole, not subsampled | `train1` and `test2` have disjoint gs classes, so any subsampling of `test2` still measures unseen-class generalization. Splitting it would waste that. |
+| Carve train/val per gs class | Otherwise a rare class could land wholly in val and make validation loss meaningless. |
+| Full frame at inference, matching training | Cropping to the blob before resizing was a train/inference distribution mismatch that made real-frame predictions incomparable to evaluation numbers. See [inference.md](inference.md). |
+| Project sigmas with `hypot`, not a linear sum | A linear sum goes negative for rotated blobs and clamps to the floor, pinning `sigma_x` to one constant in 10 of 14 classes. |
+| Match capture files structurally, not by convention | `iter_capture_images` accepts only `<train1\|test2>/<class>/*.png`, so a generated `preview.png` cannot be indexed as a frame. |
+| Keep the synthetic generator, isolated | `main.py generate` still works for experimentation, but writes to `dataset/`, never `new_dataset/`. |
 
-| Spec example | This implementation | Why |
-|---|---|---|
-| ~800 normal / 75 tilted / 100-150 noisy / 100 background (~1,100 total) | 1,500 / 75 / 250 / 175 = **2,000 total** | Explicitly requested partway through development; still within the spec's stated "1,000-6,500" range. |
-| Downsample to e.g. 224x224 | Downsampled to **128x128** | Keeps training compute light enough for a laptop CPU/MPS GPU; the spec gave 224 only as an example, not a requirement. |
-| 4 regression outputs (x, y, sigma_x, sigma_y) | 4 regression outputs **+ a 5th beam-presence logit** | The spec's own dataset breakdown includes beam-free background/ambient frames. A pure 4-output regressor has no honest target for those frames (there's no beam to locate); the presence logit lets the model learn to say "no beam" instead of hallucinating coordinates. |
-| Background subtraction via subtraction/thresholding | Subtracts a *measured* background frame when one is supplied; otherwise applies a **light median filter** instead of self-blur-subtraction | Testing found that blurring the image itself to estimate a "background" actively erases wide beams (sigma up to 90px, comparable to or larger than a typical blur kernel), destroying the very signal being measured. A median filter still removes isolated hot-pixel noise without this failure mode. |
+## Reading the results honestly
 
-One more fix worth noting: for `tilted` (rotated) samples, `sigma_x`/
-`sigma_y` in `labels.csv` are the **axis-aligned projected widths**, not
-the pre-rotation principal-axis widths used to render the ellipse. See
-[dataset.md](dataset.md) for why.
+`docs/dataset.md` documents why aggregate test MAE overstates the problem. The
+short version: beam widths are recovered to ~1.6 px on validation, test `x`
+error rises to ~82 px, and per-class evaluation shows most of that is
+concentrated in `gs23`, whose own derived labels are outliers. The three
+architectures score within 0.4 px of each other across a 72x parameter range,
+which points at label quality rather than capacity as the limiting factor.
+Treat presence accuracy as uninformative -- it is a constant on this data.

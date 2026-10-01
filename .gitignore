@@ -8,7 +8,8 @@ dataset/_synthetic_backup_*/
 # Model artifacts
 checkpoints/*.pt
 
-# Generated preview montage (regenerate with: python main.py preview)
+# Generated preview montages (regenerate with: python main.py preview)
 new_dataset/preview.png
+dataset/preview.png
 
 .DS_Store

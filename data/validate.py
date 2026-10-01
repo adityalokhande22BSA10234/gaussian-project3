@@ -63,12 +63,18 @@ def _check_labels(df, issues):
     if len(out_of_bounds):
         issues.append(f"{len(out_of_bounds)} beam centers fall outside the frame")
 
+    # The model head is sigmoid-bounded, so any label outside [0,
+    # MAX_SIGMA_NORM] is genuinely unrepresentable. The lower bound is 0
+    # rather than MIN_SIGMA/2 because the derived labels are real measured
+    # beam widths and can legitimately be tight.
     bad_sigma = beam_rows[
-        (beam_rows["sigma_x"] < config.MIN_SIGMA * 0.5) | (beam_rows["sigma_x"] > config.MAX_SIGMA * 1.2) |
-        (beam_rows["sigma_y"] < config.MIN_SIGMA * 0.5) | (beam_rows["sigma_y"] > config.MAX_SIGMA * 1.2)
+        (beam_rows["sigma_x"] <= 0) | (beam_rows["sigma_x"] > config.MAX_SIGMA_NORM) |
+        (beam_rows["sigma_y"] <= 0) | (beam_rows["sigma_y"] > config.MAX_SIGMA_NORM)
     ]
     if len(bad_sigma):
-        issues.append(f"{len(bad_sigma)} rows have sigma outside expected range")
+        issues.append(
+            f"{len(bad_sigma)} rows have sigma outside (0, {config.MAX_SIGMA_NORM}]"
+        )
 
 
 def validate_dataset(labels_csv=None, images_dir=None):

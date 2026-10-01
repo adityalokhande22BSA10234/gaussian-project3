@@ -1,6 +1,17 @@
-"""Real-image preprocessing: background subtraction and ROI extraction."""
+"""Inference-time preprocessing for the beam-parameter CNN.
+
+The model is trained on whole frames resized to `config.TRAIN_RESOLUTION`
+(see data/dataset.py), so inference must feed it the *whole frame* the same
+way. Cropping to a bright blob before resizing would shrink the beam and
+stretch it to fill the input, which is a different distribution from anything
+the network saw during training and makes its predictions meaningless.
+
+`find_blob_bbox` is kept purely for drawing an overlay on the result; it never
+feeds the network.
+"""
 import cv2
 import numpy as np
+from PIL import Image
 
 
 def load_grayscale(path):
@@ -17,7 +28,7 @@ def subtract_background(image, background=None):
     Without a real background frame there's nothing reliable to subtract:
     approximating one by blurring the image itself is only safe if the blur
     kernel is smaller than the beam, which doesn't hold for wide beams (this
-    project's sigma range goes up to ~90px) -- it would subtract away most
+    project's sigma range goes up to ~120px) -- it would subtract away most
     of the beam along with the ambient light. So we just apply a light
     median filter to kill isolated hot pixels, which leaves smooth Gaussian
     blobs of any size untouched.
@@ -27,36 +38,53 @@ def subtract_background(image, background=None):
     return cv2.medianBlur(image, 3)
 
 
-def threshold_roi(image, thresh_ratio=0.15, padding=30):
-    """Find the brightest connected blob and return a padded crop around it."""
+def find_blob_bbox(image, thresh_ratio=0.15, padding=30):
+    """Bounding box of the brightest connected blob, for display only.
+
+    Returns (x0, y0, x1, y1), or the full frame when nothing stands out.
+    """
     blurred = cv2.GaussianBlur(image, (5, 5), 0)
     thresh_val = int(blurred.max() * thresh_ratio)
     if thresh_val <= 0:
-        return None, (0, 0, image.shape[1], image.shape[0])
+        return (0, 0, image.shape[1], image.shape[0])
 
     _, mask = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None, (0, 0, image.shape[1], image.shape[0])
+        return (0, 0, image.shape[1], image.shape[0])
 
     largest = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(largest)
-    x0 = max(x - padding, 0)
-    y0 = max(y - padding, 0)
-    x1 = min(x + w + padding, image.shape[1])
-    y1 = min(y + h + padding, image.shape[0])
-    return image[y0:y1, x0:x1], (x0, y0, x1, y1)
+    return (
+        max(x - padding, 0),
+        max(y - padding, 0),
+        min(x + w + padding, image.shape[1]),
+        min(y + h + padding, image.shape[0]),
+    )
+
+
+def to_model_input(frame, resolution):
+    """Resize a grayscale frame exactly the way data/dataset.py does.
+
+    Full frame, bilinear, scaled to [0, 1], shaped (1, 1, R, R) for the CNN.
+    """
+    resized = Image.fromarray(frame).resize(
+        (resolution, resolution), Image.BILINEAR
+    )
+    arr = np.asarray(resized, dtype=np.float32) / 255.0
+    return arr.reshape(1, 1, resolution, resolution)
 
 
 def preprocess_for_inference(path, background=None):
-    """Full pipeline: load -> background-subtract -> ROI crop.
+    """Load -> optional background subtraction -> model-ready full-frame array.
 
-    Returns (raw_image, background_subtracted_image, roi_crop, roi_bbox).
-    Falls back to the full subtracted frame if no beam-like blob is found.
+    Returns (raw_image, background_subtracted_image, model_input, blob_bbox).
+    The model input is always the *full* frame, matching training.
     """
+    import config
+
     img = load_grayscale(path)
     subtracted = subtract_background(img, background)
-    roi, bbox = threshold_roi(subtracted)
-    if roi is None or roi.size == 0:
-        roi, bbox = subtracted, (0, 0, img.shape[1], img.shape[0])
-    return img, subtracted, roi, bbox
+    model_input = to_model_input(subtracted, config.TRAIN_RESOLUTION)
+    bbox = find_blob_bbox(subtracted)
+    return img, subtracted, model_input, bbox

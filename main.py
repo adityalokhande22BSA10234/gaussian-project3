@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Single entry point for the synthetic Gaussian-beam CNN regression pipeline.
+"""Single entry point for the Gaussian-beam CNN regression pipeline.
 
-Run with no arguments for the default end-to-end pipeline: generate the
-dataset if it isn't already on disk, then train all three CNN models
-(tiny/medium/resnet18) and print a summary.
+The dataset is the real BPM capture set under `new_dataset/`. Per-image labels
+are derived from each frame by data/real_dataset.py, then used to train the
+regression CNNs (tiny/medium/resnet18).
 
     python main.py                 # == python main.py all
 
 Subcommands (see README.md for the full reference):
 
-    python main.py all         # generate-if-missing, then train all models
-    python main.py generate    # build the synthetic dataset
+    python main.py all         # build labels if missing, then train all models
+    python main.py labels      # extract labels.csv from the captured frames
+    python main.py generate    # build the synthetic dataset (legacy)
     python main.py validate    # check image/label quality
     python main.py preview     # save a per-category sample grid
     python main.py train       # train a single regression CNN
@@ -23,6 +24,7 @@ from pathlib import Path
 
 import config
 from data.preview import save_preview_grid
+from data.real_dataset import build_label_index, iter_capture_images
 from data.validate import print_validation_report, validate_dataset
 from inference.infer import run_inference
 from synthetic.dataset_builder import build_dataset
@@ -31,12 +33,23 @@ from training.train import train_model
 
 
 def dataset_exists(labels_csv=None, images_dir=None):
-    """True if a generated dataset (labels.csv + at least one image) is on disk."""
+    """True if labels.csv exists and matches the captures currently on disk."""
     labels_csv = Path(labels_csv or config.LABELS_CSV)
     images_dir = Path(images_dir or config.IMAGES_DIR)
     if not labels_csv.exists() or not images_dir.exists():
         return False
-    return next(images_dir.rglob("*.png"), None) is not None
+
+    import pandas as pd
+    on_disk = sum(1 for _ in iter_capture_images(images_dir))
+    labeled = len(pd.read_csv(labels_csv))
+    if on_disk != labeled:
+        print(f"Index is stale: {labeled} label rows for {on_disk} captures on disk.")
+        return False
+    return True
+
+
+def cmd_labels(args):
+    build_label_index(args.images_dir, args.labels_csv, args.val_split, args.seed)
 
 
 def cmd_generate(args):
@@ -66,7 +79,7 @@ def cmd_train(args):
 
 
 def cmd_evaluate(args):
-    metrics = evaluate_model(args.labels_csv, args.images_dir, args.model_path, args.split)
+    metrics = evaluate_model(args.labels_csv, args.images_dir, args.model_path, args.split, args.by_category)
     print(f"Model: {metrics['model_name']}")
     print(f"Beam-presence accuracy: {metrics['presence_accuracy']:.3f}")
     if metrics["mae"] is not None:
@@ -74,6 +87,12 @@ def cmd_evaluate(args):
         print(f"MAE (pixels) -> x: {x:.2f}  y: {y:.2f}  sigma_x: {sx:.2f}  sigma_y: {sy:.2f}")
     else:
         print("No beam-present samples found in this split.")
+    for row in metrics.get("mae_by_category", []):
+        print(
+            f"  {row['category']:<6} n={row['count']:<4}"
+            f" x: {row['mae_x']:>7.2f}  y: {row['mae_y']:>7.2f}"
+            f"  sigma_x: {row['mae_sigma_x']:>7.2f}  sigma_y: {row['mae_sigma_y']:>7.2f}"
+        )
 
 
 def cmd_infer(args):
@@ -107,10 +126,10 @@ def _print_footer(results):
 
 def cmd_all(args):
     if dataset_exists(args.labels_csv, args.images_dir):
-        print(f"Dataset found at {args.images_dir} -- skipping generation.")
+        print(f"Labels found at {args.labels_csv} -- skipping extraction.")
     else:
-        print("No dataset found -- generating synthetic dataset...")
-        build_dataset(output_dir=Path(args.images_dir).parent, seed=config.RANDOM_SEED)
+        print("Extracting labels from the captured frames...")
+        build_label_index(args.images_dir, args.labels_csv)
 
     results = {}
     for model_name in args.models:
@@ -125,11 +144,11 @@ def cmd_all(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="main.py",
-        description="Synthetic Gaussian-beam CNN regression pipeline (generate -> train -> infer).",
+        description="Gaussian-beam CNN regression pipeline (labels -> train -> infer).",
     )
     sub = parser.add_subparsers(dest="command")
 
-    p_all = sub.add_parser("all", help="Generate the dataset if missing, then train all models (default)")
+    p_all = sub.add_parser("all", help="Extract labels if missing, then train all models (default)")
     p_all.add_argument("--labels-csv", default=str(config.LABELS_CSV))
     p_all.add_argument("--images-dir", default=str(config.IMAGES_DIR))
     p_all.add_argument("--models", nargs="+", default=list(config.MODEL_CHOICES), choices=list(config.MODEL_CHOICES))
@@ -138,8 +157,15 @@ def build_parser():
     p_all.add_argument("--lr", type=float, default=config.LEARNING_RATE)
     p_all.set_defaults(func=cmd_all)
 
-    p_gen = sub.add_parser("generate", help="Generate the synthetic dataset")
-    p_gen.add_argument("--output-dir", default=str(config.DATASET_DIR))
+    p_labels = sub.add_parser("labels", help="Extract labels.csv from the captured frames")
+    p_labels.add_argument("--images-dir", default=str(config.IMAGES_DIR))
+    p_labels.add_argument("--labels-csv", default=str(config.LABELS_CSV))
+    p_labels.add_argument("--val-split", type=float, default=config.VAL_SPLIT)
+    p_labels.add_argument("--seed", type=int, default=config.RANDOM_SEED)
+    p_labels.set_defaults(func=cmd_labels)
+
+    p_gen = sub.add_parser("generate", help="Generate the synthetic dataset (legacy)")
+    p_gen.add_argument("--output-dir", default=str(config.SYNTHETIC_DIR))
     p_gen.add_argument("--normal", type=int, default=config.NUM_NORMAL)
     p_gen.add_argument("--tilted", type=int, default=config.NUM_TILTED)
     p_gen.add_argument("--noisy", type=int, default=config.NUM_NOISY)
@@ -174,6 +200,7 @@ def build_parser():
     p_eval.add_argument("--images-dir", default=str(config.IMAGES_DIR))
     p_eval.add_argument("--model-path", default=str(config.checkpoint_path(config.MODEL_NAME)))
     p_eval.add_argument("--split", default="test", choices=["train", "val", "test"])
+    p_eval.add_argument("--by-category", action="store_true", help="Also report MAE per gs class")
     p_eval.set_defaults(func=cmd_evaluate)
 
     p_infer = sub.add_parser("infer", help="Run inference on a real beam-camera image")
